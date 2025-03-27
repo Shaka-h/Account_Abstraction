@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 
-// zkSync Era Imports
 import {
     IAccount,
     ACCOUNT_VALIDATION_SUCCESS_MAGIC
@@ -10,6 +9,20 @@ import {
     Transaction,
     MemoryTransactionHelper
 } from "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/MemoryTransactionHelper.sol";
+import {SystemContractsCaller} from
+    "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/SystemContractsCaller.sol";
+import {
+    NONCE_HOLDER_SYSTEM_CONTRACT,
+    BOOTLOADER_FORMAL_ADDRESS,
+    DEPLOYER_SYSTEM_CONTRACT
+} from "lib/foundry-era-contracts/src/system-contracts/contracts/Constants.sol";
+import {INonceHolder} from "lib/foundry-era-contracts/src/system-contracts/contracts/interfaces/INonceHolder.sol";
+import {Utils} from "lib/foundry-era-contracts/src/system-contracts/contracts/libraries/Utils.sol";
+
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+
 
 /**
  * Lifecycle of a type 113 (0x71) transaction
@@ -29,25 +42,127 @@ import {
  * 9. If a paymaster was used, the postTransaction is called
  */
 
-contract ZkMinimalAccount is IAccount {
+contract ZkMinimalAccount is IAccount, Ownable {
+    using MemoryTransactionHelper for Transaction;
+
+    error ZkMinimalAccount_NotEnoughBalance();
+    error ZkMinimalAccount_NotFromBootLoader();
+    error ZkMinimalAccount_ExecutionFailed();
+    error ZkMinimalAccount_NotFromBootLoaderOrOwner();
+    error ZkMinimalAccount_FailedToPay();
+
+    constructor() Ownable(msg.sender){
+
+    }
+
+    receive() external payable {}
+
+    modifier requireFromBootLoader(){
+        if(msg.sender != BOOTLOADER_FORMAL_ADDRESS){
+            revert ZkMinimalAccount_NotFromBootLoader();
+            _;
+        }
+    }
+
+    modifier requireFromBootLoaderOrOwner(){
+        if(msg.sender != BOOTLOADER_FORMAL_ADDRESS && msg.sender != owner()){
+            revert ZkMinimalAccount_NotFromBootLoaderOrOwner();
+            _;
+        }
+    }
+
     function validateTransaction(bytes32 _txHash, bytes32 _suggestedSignedHash, Transaction memory _transaction) // -> similar to validateUserOp
         external
         payable
-        returns (bytes4 magic){}
+        requireFromBootLoader
+        returns (bytes4 magic){
+            _validateTransaction(_transaction);
+        }
 
     function executeTransaction(bytes32 _txHash, bytes32 _suggestedSignedHash, Transaction memory _transaction)
         external
-        payable{}
+        payable
+        requireFromBootLoaderOrOwner {
+            _executeTransaction(_transaction);
+        }
 
     // There is no point in providing possible signed hash in the `executeTransactionFromOutside` method,
     // since it typically should not be trusted.
-    function executeTransactionFromOutside(Transaction memory _transaction) external payable{}
+    // so far we can sign txn and send to zksyn as an account abstraction however we couldalso send it as a normal transaction with everything signedand have someone else pay the gas fees and send it
+    //validate and execute txn
+    function executeTransactionFromOutside(Transaction memory _transaction) external payable{
+        _validateTransaction(_transaction);
+        _executeTransaction(_transaction);
+    }
 
     function payForTransaction(bytes32 _txHash, bytes32 _suggestedSignedHash, Transaction memory _transaction)
         external
-        payable{}
+        payable{
+            bool success = _transaction.payToTheBootloader();
+            if(!success){
+                revert ZkMinimalAccount_FailedToPay();
+            }
+        }
 
     function prepareForPaymaster(bytes32 _txHash, bytes32 _possibleSignedHash, Transaction memory _transaction)
         external
         payable{}
+
+    function _validateTransaction(Transaction memory _transaction) 
+        internal
+        returns (bytes4 magic){
+
+            //increse the nonce
+            // call nonce holder
+            //call(x,y,z) -> system contract call
+            SystemContractsCaller.systemCallWithPropagatedRevert(
+                uint32(gasleft()),
+                address(NONCE_HOLDER_SYSTEM_CONTRACT),
+                0,
+                abi.encodeCall(INonceHolder.incrementMinNonceIfEquals, (_transaction.nonce))
+            );
+
+            //check for fee to pay, does this contract have enough balance. this is where u add the paymaster
+            uint256 totalRequiredBalance = _transaction.totalRequiredBalance();
+            if (totalRequiredBalance > address(this).balance) {
+                revert ZkMinimalAccount_NotEnoughBalance();
+            }
+
+            //check the signature
+            bytes32 txHash = _transaction.encodeHash();
+            bytes32 convertedHash = MessageHashUtils.toEthSignedMessageHash(txHash);
+            address signer = ECDSA.recover(convertedHash, _transaction.signature);
+            bool isValidSigner = signer == owner();
+
+            if(isValidSigner){
+                magic = ACCOUNT_VALIDATION_SUCCESS_MAGIC;
+            }else{
+                magic = bytes4(0); //equivalent to saying false
+            }
+
+            return magic;
+        }
+
+        function _executeTransaction(Transaction memory _transaction)
+            internal{
+                address to = address(uint160(_transaction.to));
+                uint128 value = Utils.safeCastToU128(_transaction.value);
+                bytes memory data = _transaction.data;
+                if(to == address(DEPLOYER_SYSTEM_CONTRACT)){
+                    //if to is any system contract
+                    uint32 gas = Utils.safeCastToU32(gasleft());
+                    SystemContractsCaller.systemCallWithPropagatedRevert(gas, to, value, data);
+                }else{
+                    bool success;
+
+                    assembly {
+                        success := call(gas(), to, value, add(data, 0x20), mload(data), 0, 0)
+                    }
+
+                    if(!success){
+                        revert ZkMinimalAccount_ExecutionFailed();
+                    }
+                }
+            }
+
 }
